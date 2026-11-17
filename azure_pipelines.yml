@@ -1,0 +1,75 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: Release
+  packageOutputPath: $(Build.ArtifactStagingDirectory)/nupkgs
+  isPublishable: $[and(ne(variables['Build.Reason'], 'PullRequest'), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/tags/v')))]
+  isReleaseTag: $[startsWith(variables['Build.SourceBranch'], 'refs/tags/v')]
+
+steps:
+  - task: UseDotNet@2
+    displayName: Install .NET SDK (from global.json)
+    inputs:
+      packageType: sdk
+      useGlobalJson: true
+      includePreviewVersions: true
+
+  - script: dotnet build --configuration $(buildConfiguration) -p:ContinuousIntegrationBuild=true
+    displayName: Build
+
+  - script: dotnet test --configuration $(buildConfiguration) --no-build --report-xunit-trx --results-directory "$(Agent.TempDirectory)/TestResults"
+    displayName: Test
+
+  - task: PublishTestResults@2
+    displayName: Publish test results
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: VSTest
+      testResultsFiles: '**/*.trx'
+      searchFolder: $(Agent.TempDirectory)/TestResults
+      failTaskOnMissingResultsFile: false
+
+  - bash: |
+      set -euo pipefail
+      if [ "$(isReleaseTag)" = "True" ]; then
+        versionArgs=""
+      else
+        versionArgs="--version-suffix ci.$(Build.BuildNumber)"
+      fi
+      dotnet pack EFCore.NamingConventions/EFCore.NamingConventions.csproj \
+        --configuration $(buildConfiguration) \
+        --output "$(packageOutputPath)" \
+        $versionArgs \
+        -p:ContinuousIntegrationBuild=true
+    displayName: Pack
+    condition: and(succeeded(), eq(variables.isPublishable, 'True'))
+
+  - publish: $(packageOutputPath)
+    artifact: nupkgs
+    displayName: Upload packages as build artifact
+    condition: and(succeeded(), eq(variables.isPublishable, 'True'))
+
+  - task: DotNetCoreCLI@2
+    displayName: Push to copperenergy feed
+    condition: and(succeeded(), eq(variables.isPublishable, 'True'))
+    inputs:
+      command: push
+      packagesToPush: $(packageOutputPath)/*.nupkg
+      nuGetFeedType: internal
+      publishVstsFeed: copperenergy
